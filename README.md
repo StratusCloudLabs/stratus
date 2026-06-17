@@ -78,7 +78,7 @@ docker build -t stratus-runtime:dev .
 GITHUB_WEBHOOK_SECRET=... \
 GOOGLE_CLOUD_PROJECT=your-gcp-project \
 RUNNER_NAMESPACE=arc-runners \
-GHCR_BASE=ghcr.io/your-org \
+GHCR_BASE=ghcr.io/stratuscloudlabs \
 ./stratus-runtime
 ```
 
