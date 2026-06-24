@@ -1,0 +1,218 @@
+name: Runner Router
+
+on:
+  workflow_call:
+    inputs:
+      workflow_key:
+        required: false
+        type: string
+        default: ""
+        description: "Workflow filename for legacy routing mode."
+      router_ref:
+        required: false
+        type: string
+        default: main
+      arch:
+        required: false
+        type: string
+        default: "any"
+        description: "CPU architecture: x64, arm64, or any"
+      tier:
+        required: false
+        type: string
+        default: "standard"
+        description: "Resource tier: nano, system, standard, medium, or high"
+      docker:
+        required: false
+        type: boolean
+        default: false
+        description: "Requires Docker-in-Docker capability"
+      platform:
+        required: false
+        type: string
+        default: "linux"
+        description: "Platform: linux or macos"
+      isolation:
+        required: false
+        type: string
+        default: "runc"
+        description: "Isolation: runc, kata, gvisor, firecracker"
+      purpose:
+        required: false
+        type: string
+        default: "ci"
+        description: "Purpose: ci, agents, docker, security, android"
+      repo_name:
+        required: false
+        type: string
+        default: ""
+        description: "Repository name (legacy mode)"
+    outputs:
+      target_pool:
+        description: Chosen runner pool.
+        value: ${{ jobs.route.outputs.target_pool }}
+      target_runner:
+        description: Concrete runs-on value for the caller job.
+        value: ${{ jobs.route.outputs.target_runner }}
+      target_runner_base:
+        description: Base runner label chosen before Stratus JIT isolation.
+        value: ${{ jobs.route.outputs.target_runner_base }}
+      decision_reason:
+        description: Comma-separated reason codes for the decision.
+        value: ${{ jobs.route.outputs.decision_reason }}
+      metrics_live:
+        description: Whether the router used live Prometheus metrics.
+        value: ${{ jobs.route.outputs.metrics_live }}
+      evidence_json:
+        description: JSON blob of the measured routing signals.
+        value: ${{ jobs.route.outputs.evidence_json }}
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  route:
+    # CRITICAL: Route on the live StratusCloudLabs bridge pool so routing still
+    # works when GitHub-hosted billing is exhausted. The broader cutover to the
+    # generic ci-system label remains tracked separately in #3677.
+    # Prometheus is only reached when this job runs on a GitHub-hosted runner.
+    # Starting tailscaled from tailscale/github-action is unreliable on ARC
+    # self-hosted runners and can terminate the route job before fallback.
+    # If Tailscale/Prometheus is unreachable, runner-router.py already falls
+    # back gracefully via fallback_decision().
+    runs-on: stratus-ci-system
+    timeout-minutes: 10
+    outputs:
+      target_pool: ${{ steps.route.outputs.target_pool }}
+      target_runner: ${{ steps.dispatch_label.outputs.target_runner }}
+      target_runner_base: ${{ steps.route.outputs.target_runner }}
+      decision_reason: ${{ steps.route.outputs.decision_reason }}
+      metrics_live: ${{ steps.route.outputs.metrics_live }}
+      evidence_json: ${{ steps.route.outputs.evidence_json }}
+    steps:
+      - name: Connect to Tailscale for Prometheus access
+        id: tailscale
+        if: ${{ runner.environment == 'github-hosted' }}
+        continue-on-error: true
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Resolve router GitHub credentials
+        id: github_auth
+        env:
+          STRATUS_APP_ID: ${{ vars.STRATUS_APP_ID }}
+          STRATUS_PRIVATE_KEY: ${{ secrets.STRATUS_PRIVATE_KEY }}
+          GH_READ_TOKEN: ${{ secrets.GH_READ_TOKEN }}
+        run: |
+          # ARC org-level app decommissioned (Jan 2026); use Stratus app only.
+          if [ -n "$STRATUS_APP_ID" ] && [ -n "$STRATUS_PRIVATE_KEY" ]; then
+            {
+              echo "auth_mode=app"
+              echo "app_id=$STRATUS_APP_ID"
+              echo "private_key<<EOF"
+              printf '%s\n' "$STRATUS_PRIVATE_KEY"
+              echo "EOF"
+              if [ -n "$GH_READ_TOKEN" ]; then
+                echo "token=$GH_READ_TOKEN"
+              fi
+            } >> "$GITHUB_OUTPUT"
+          elif [ -n "$GH_READ_TOKEN" ]; then
+            {
+              echo "auth_mode=token"
+              echo "token=$GH_READ_TOKEN"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "auth_mode=github_token" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate Stratus App Token
+        id: app_token
+        if: steps.github_auth.outputs.auth_mode == 'app'
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ steps.github_auth.outputs.app_id }}
+          private-key: ${{ steps.github_auth.outputs.private_key }}
+          owner: StratusCloudLabs
+
+      - name: Checkout router repository
+        uses: actions/checkout@v6
+        with:
+          repository: StratusCloudLabs/stratus
+          ref: ${{ inputs.router_ref || 'main' }}
+          path: .infra-router
+          token: ${{ steps.app_token.outputs.token || steps.github_auth.outputs.token || github.token }}
+
+      - name: Route workflow
+        id: route
+        env:
+          GITHUB_ORG: StratusCloudLabs
+          ROUTER_GITHUB_TOKEN: ${{ steps.app_token.outputs.token || steps.github_auth.outputs.token || github.token }}
+          STRATUS_PROMETHEUS_URL: ${{ vars.STRATUS_PROMETHEUS_URL }}
+        run: |
+          # Prometheus URL comes from Stratus-managed org variable.
+          # If Tailscale connected + URL configured: live metrics routing.
+          # Otherwise: runner-router.py falls back gracefully (no metrics).
+          PROM_URL="${STRATUS_PROMETHEUS_URL:-}"
+          if [ -z "$PROM_URL" ] || [ "${{ steps.tailscale.outcome }}" != "success" ]; then
+            PROM_URL=""
+          fi
+
+          # Detect routing mode: capability-based or legacy
+          if [ "${{ inputs.arch }}" != "any" ] || [ "${{ inputs.tier }}" != "standard" ] || [ "${{ inputs.docker }}" = "true" ] || [ "${{ inputs.platform }}" != "linux" ] || [ "${{ inputs.isolation }}" != "runc" ] || [ "${{ inputs.purpose }}" != "ci" ]; then
+            echo "Using capability-based routing"
+            python3 .infra-router/scripts/runner-router.py \
+              --capabilities .infra-router/.github/runner-capabilities.yaml \
+              --arch "${{ inputs.arch }}" \
+              --tier "${{ inputs.tier }}" \
+              ${{ inputs.docker && '--docker' || '' }} \
+              --platform "${{ inputs.platform }}" \
+              --isolation "${{ inputs.isolation }}" \
+              --purpose "${{ inputs.purpose }}" \
+              ${PROM_URL:+--prometheus-url "$PROM_URL"}
+          elif [ -n "${{ inputs.workflow_key }}" ]; then
+            echo "Using legacy workflow-key routing"
+            python3 .infra-router/scripts/runner-router.py \
+              --policy .infra-router/.github/runner-routing-policy.json \
+              --repo-name "${{ inputs.repo_name || github.event.repository.name }}" \
+              --workflow-key "${{ inputs.workflow_key }}" \
+              ${PROM_URL:+--prometheus-url "$PROM_URL"}
+          else
+            echo "Using default capability-based routing (tier: standard)"
+            python3 .infra-router/scripts/runner-router.py \
+              --capabilities .infra-router/.github/runner-capabilities.yaml \
+              --tier standard \
+              ${PROM_URL:+--prometheus-url "$PROM_URL"}
+          fi
+
+      - name: Isolate Stratus JIT target label
+        id: dispatch_label
+        env:
+          BASE_RUNNER: ${{ steps.route.outputs.target_runner }}
+          ROUTE_PURPOSE: ${{ inputs.purpose }}
+        run: |
+          set -euo pipefail
+
+          base_runner="${BASE_RUNNER:-}"
+          case "$base_runner" in
+            ci-*|agents-*|docker-*|security-*|bare-*)
+              safe_purpose="$(
+                printf '%s' "${ROUTE_PURPOSE:-ci}" |
+                tr '[:upper:]' '[:lower:]' |
+                tr -c 'a-z0-9._-' '-'
+              )"
+              safe_purpose="${safe_purpose#-}"
+              safe_purpose="${safe_purpose%-}"
+              if [ -z "$safe_purpose" ]; then
+                safe_purpose="ci"
+              fi
+               echo "target_runner=stratus-${base_runner}" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "target_runner=$base_runner" >> "$GITHUB_OUTPUT"
+              ;;
+          esac

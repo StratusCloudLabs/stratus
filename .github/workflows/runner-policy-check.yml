@@ -1,0 +1,1553 @@
+name: Runner Policy Check
+
+# Reusable workflow called from Gate in every repo.
+# Validates that all workflow files use approved runners.
+#
+# Canonical policy: github/runner-policy.yml
+# When updating the policy file, update the RUNNER_POLICY heredoc below too.
+
+on:
+  workflow_call:
+    # NOTE: intentionally no `secrets:` declaration. Declaring named secrets
+    # on a reusable workflow causes GitHub to disable `secrets: inherit` for
+    # those names (documented behavior: https://docs.github.com/en/actions/
+    # using-workflows/reusing-workflows#passing-inputs-and-secrets-to-a-
+    # reusable-workflow). Every Gate caller in this org uses `secrets:
+    # inherit`, so declaring RUNNER_POLICY_PRIVATE_KEY / STRATUS_PRIVATE_KEY
+    # here broke all caller-side runner-policy runs. The bot reads
+    # secrets.* directly at runtime; no declaration needed.
+  push:
+    branches: [main]
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.repository }}-${{ github.event_name }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+# This is static YAML validation. Resolve the execution lane through the Stratus
+# router so downstream Gate callers do not depend on a raw runner label.
+jobs:
+  route:
+    uses: ./.github/workflows/runner-router.yml
+    with:
+      tier: system
+    permissions:
+      actions: read
+      contents: read
+    secrets: inherit
+
+  push-noop:
+    if: github.event_name == 'push'
+    needs: [route]
+    runs-on: ${{ needs.route.outputs.target_runner }}
+    timeout-minutes: 2
+    steps:
+      - name: Mark push run successful
+        run: echo "Runner policy check is reusable-only; push runs are a no-op."
+
+  check-runners:
+    # Reusable workflows inherit the caller event name (for example pull_request),
+    # so any non-push invocation here is the real policy enforcement path.
+    if: github.event_name != 'push'
+    needs: [route]
+    runs-on: ${{ needs.route.outputs.target_runner }}
+    timeout-minutes: 10
+    steps:
+      - name: Checkout PR code
+        uses: actions/checkout@v6
+
+      - name: Write runner policy
+        run: |
+          # Build the expression delimiters at shell runtime so push loads this
+          # workflow without requiring a workflow_call inputs context.
+          OPEN_EXPR='$''{{'
+          CLOSE_EXPR='}''}'
+          cat > /tmp/runner-policy.yml <<POLICY_EOF
+          default_allowed:
+            - ubuntu-latest
+            - ubuntu-24.04
+            - ubuntu-24.04-arm
+            - ubuntu-22.04
+            - ubuntu-22.04-arm
+            - macos-latest
+            - windows-latest
+            # Nano tier — ultra-lightweight workflows (stratus#3119)
+            - ci-nano
+            # System tier — always-on for critical routing workflows (stratus#2678)
+            - ci-system
+            # Unified arch-agnostic tiers (infra#2380) — canonical source: github/runner-policy.yml
+            - ci-standard
+            - ci-medium
+            - ci-high
+            - agents-standard
+            - agents-medium
+            - agents-high
+            # Arch-pinned legacy tiers (kept during migration; removed in Phase 6)
+            - ci-standard-runc
+            - ci-medium-runc
+            - ci-high-runc
+            - ci-standard-runc-x64
+            - ci-standard-vz-arm64
+            - ci-medium-runc-x64
+            - ci-medium-vz-arm64
+            - ci-android-runc-x64
+            - ci-android-vz-arm64
+            - ci-high-runc-x64
+            - ci-high-vz-arm64
+            - agents-standard-runc
+            - agents-medium-runc
+            - agents-high-runc
+            - agents-standard-runc-x64
+            - agents-standard-vz-arm64
+            - agents-medium-runc-x64
+            - agents-medium-vz-arm64
+            - agents-high-runc-x64
+            - agents-high-vz-arm64
+            - security-standard-runc
+            - macos-ci
+          allowed_groups:
+            - ci-standard
+            - ci-medium
+            - ci-high
+            - linux-agents
+            - macos-ci
+          exceptions:
+            Scheduler:
+              - macos-ci
+              - macos-ios-runners
+              - bare-high-arm64
+            stratus:
+              - macos-host
+              - bare-high-arm64
+              - docker-standard-dind-x64
+              - docker-medium-dind-x64
+              - docker-medium-dind-arm64
+              - docker-high-dind-x64
+              - docker-high-dind-arm64
+              - linux-docker
+              - ubuntu-latest
+            gal-run-private:
+              - bare-high-arm64
+              - docker-high-dind
+            financial:
+              - docker-high-dind
+          private_repos_default_self_hosted: true
+          github_hosted_primary_private_repos: []
+          github_hosted_exceptions:
+            _global:
+              - gate.yml
+            stratus:
+              - apply-workload-rbac.yml
+              - build-arc-runner.yml
+              - deploy-gal-api.yml
+              - deploy-gal-admin.yml
+              - deploy-stratus.yml
+              - runner-policy-check.yml
+              - runner-router.yml
+              - runner-control-plane-validate.yml
+              - tailscale-health-check.yml
+            gal-run-private:
+              - arc-runner-images.yml
+              - release.yml
+              - runner-router.yml
+            Zenux:
+              - deploy-cloud-run.yml
+          hybrid_overflow_workflows:
+            stratus:
+              - apply-argocd-overrides.yml
+              - apply-workloads.yml
+              - arc-scale-set-capacity-validate.yml
+              - build-stratus-bootstrap.yml
+              - build-stratus-mcp.yml
+              - build-stratus-reconciler.yml
+              - build-stratus-shell.yml
+              - build-vllm-sm120.yml
+              - checkov-iac-scan.yml
+              - cloud-security-audit.yml
+              - codeql-analysis.yml
+              - container-security-scan.yml
+              - credential-expiry-check.yml
+              - deploy-agent-model.yml
+              - deploy-governance-serverless.yml
+              - deploy-stratus.yml
+              - enforce-assignee.yml
+              - enforce-milestone.yml
+              - enforce-tests.yml
+              - github-billing-budget-check.yml
+              - gpu-dispatch.yml
+              - hygiene-workflow-act-validate.yml
+              - iac-security-scan.yml
+              - network-forensics-guardrails.yml
+              - pr-governance.yml
+              - quarterly-access-review.yml
+              - release-stratus-cli.yml
+              - routing-policy-sync.yml
+              - secret-scan.yml
+              - security-alert-bridge.yml
+              - stratus-ci.yml
+              - stratus-e2e.yml
+              - stratus-soak.yml
+              - sync-runpod-secret.yml
+              - system-hardening-audit.yml
+              - workflow-runner-audit.yml
+            marketing:
+              - auto-post-approved.yml
+              - biweekly-aso-export.yml
+              - biweekly-john-rush.yml
+              - daily-backlinks.yml
+              - daily-guest-post-recheck.yml
+              - directory-submissions.yml
+              - enforce-assignee.yml
+              - release-growth-console.yml
+              - seo-tools-backup.yml
+              - weekly-competitor-intel.yml
+              - weekly-research.yml
+            operations:
+              - claude-code-review.yml
+              - claude.yml
+              - deploy-firebase.yml
+              - deploy-firestore.yml
+              - deploy-functions.yml
+              - enforce-assignee.yml
+              - enforce-milestone.yml
+              - github-ingest.yml
+              - pr-governance.yml
+              - pr-test-plan-guard.yml
+              - release-production.yml
+            project-master:
+              - cross-post-blog.yml
+              - enforce-assignee.yml
+              - firebase-hosting-preview.yml
+              - firebase-hosting.yml
+              - generate-blog-post.yml
+              - legal-notifications-preview.yml
+              - legal-notifications-send.yml
+              - unit-tests.yml
+            Scheduler:
+              - android-build.yml
+              - code-analysis.yml
+              - codeql-analysis.yml
+              - enforce-assignee.yml
+              - enforce-milestone.yml
+              - pr-governance.yml
+            gal-run-private:
+              - admin-deploy.yml
+              - artifact-cleanup.yml
+              - benchmark-governance.yml
+              - ci.yml
+              - close-verified-release-issues.yml
+              - codeql-analysis.yml
+              - collect-test-plan.yml
+              - dependency-scan.yml
+              - deploy-api.yml
+              - deploy-governance-cloudrun.yml
+              - deploy-governance-serverless.yml
+              - domain-allowlist-check.yml
+              - e2e.yml
+              - enforce-assignee.yml
+              - enforce-milestone.yml
+              - enforce-sdlc.yml
+              - grant-vertex-runtime-access.yml
+              - homebrew-bump.yml
+              - issue-hygiene.yml
+              - org-workflow-runner-audit.yml
+              - policy-check.yml
+              - post-merge-maintenance.yml
+              - pr-governance.yml
+              - queue-governor.yml
+              - refresh-background-agent-runner-image.yml
+              - reopen-auto-closed-issues.yml
+              - require-issue-reference.yml
+              - retrain-governance-model.yml
+              - runner-policy-check.yml
+              - scheduled-branch-pruning.yml
+              - scheduled-scan.yml
+              - sdlc-compliance.yml
+              - sdlc-test-suite.yml
+              - sync-release-version.yml
+              - synthetic-production-monitor.yml
+              - terraform.yml
+              - validate-schema.yml
+            business-ops-admin:
+              - enforce-assignee.yml
+              - enforce-milestone.yml
+              - pr-governance.yml
+              - weekly-kpi-export.yml
+            company-website:
+              - enforce-assignee.yml
+              - enforce-milestone.yml
+              - pr-governance.yml
+            financial:
+              - enforce-assignee.yml
+            legal:
+              - enforce-assignee.yml
+              - enforce-milestone.yml
+              - pr-governance.yml
+            marketing:
+              - auto-post-approved.yml
+              - biweekly-aso-export.yml
+              - biweekly-john-rush.yml
+              - daily-backlinks.yml
+              - daily-guest-post-recheck.yml
+              - directory-submissions.yml
+              - enforce-assignee.yml
+              - eval-tracks.yml
+              - release-growth-console.yml
+              - seo-tools-backup.yml
+              - weekly-competitor-intel.yml
+              - weekly-research.yml
+            brevo-email-templates:
+              - enforce-assignee.yml
+            imagined-cosmos:
+              - enforce-milestone.yml
+              - pr-governance.yml
+              - release.yml
+            keep-mcp:
+              - enforce-assignee.yml
+              - enforce-milestone.yml
+              - pr-governance.yml
+            llm-conf-test:
+              - copilot-setup-steps.yml
+              - enforce-assignee.yml
+          dynamic_patterns:
+            - '${OPEN_EXPR} inputs.runs-on ${CLOSE_EXPR}'
+            - '${OPEN_EXPR} inputs.runner_label ${CLOSE_EXPR}'
+            - '${OPEN_EXPR} inputs.runner_group ${CLOSE_EXPR}'
+          POLICY_EOF
+
+      - name: Write unified-scheduling exceptions policy
+        run: |
+          # Mirrors github/runner-policy-exceptions.yml (infra#2380 Phase 5).
+          # Embedded inline so the reusable workflow stays independent of the
+          # caller repo's filesystem. When updating the canonical file, update
+          # this heredoc too.
+          cat > /tmp/runner-policy-exceptions.yml <<'EXCEPTIONS_EOF'
+          enforcement_enabled: true
+          unified_tier_labels:
+            - ci-standard
+            - ci-medium
+            - ci-high
+            - agents-standard
+            - agents-medium
+            - agents-high
+            - security-standard
+            - docker-standard-dind
+            - docker-medium-dind
+            - docker-high-dind
+          deprecated_arch_pinned_labels:
+            - ci-standard-runc-x64
+            - ci-medium-runc-x64
+            - ci-high-runc-x64
+            - agents-standard-runc-x64
+            - agents-medium-runc-x64
+            - agents-high-runc-x64
+            - ci-standard-vz-arm64
+            - ci-medium-vz-arm64
+            - ci-high-vz-arm64
+            - agents-standard-vz-arm64
+            - agents-medium-vz-arm64
+            - agents-high-vz-arm64
+            - docker-high-dind-x64
+            - docker-medium-dind-x64
+            - docker-standard-dind-x64
+          # NOTE: bare-high-arm64 intentionally excluded — it's specific Mac
+          # hardware (mac-pro-1, mac-mini-1, mac-mini-2), not deprecated.
+          exceptions:
+            - workflow: Scheduler-Systems/Scheduler/.github/workflows/flutter_web_e2e.yml
+              reason: "Android E2E — NDK + Android SDK are amd64-only"
+              allowed_labels:
+                - ci-android-runc-x64
+            - workflow: Scheduler-Systems/Scheduler/.github/workflows/android-build.yml
+              reason: "Android AAB/APK — NDK + Android SDK are amd64-only"
+              allowed_labels:
+                - ci-android-runc-x64
+            - workflow: Scheduler-Systems/stratus/.github/workflows/build-arc-runner.yml
+              reason: "Builds the amd64 runner image itself — must run on amd64 host"
+              allowed_labels:
+                - docker-high-dind-x64
+                - ci-standard-runc-x64
+            - workflow: Scheduler-Systems/stratus/.github/workflows/build-gha-queue-exporter.yml
+              reason: "Docker buildx multi-arch build orchestrator"
+              allowed_labels:
+                - docker-high-dind-x64
+            - workflow: gal-run/gal-cli/.github/workflows/background-agent-session.yml
+              reason: "agents-kali-runc — Kali tools image is amd64-only"
+              allowed_labels:
+                - agents-kali-runc
+            - workflow: Scheduler-Systems/Scheduler/.github/workflows/dependency-scan.yml
+              reason: "Trivy security scan — deferrable to arm64 later, allowlisted for now"
+              allowed_labels:
+                - security-standard-runc
+            - workflow: Scheduler-Systems/financial/.github/workflows/deploy-finance-tracker.yml
+              reason: "finance-tracker image build + push — Docker buildx needs a daemon"
+              allowed_labels:
+                - docker-high-dind-x64
+          EXCEPTIONS_EOF
+
+      - name: Validate workflow runners
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          POLICY="/tmp/runner-policy.yml"
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          REPO_VISIBILITY="unknown"
+          VIOLATIONS=()
+          # Retired arch-pinned labels that have a 1:1 unified-tier replacement.
+          # Tracked separately so the Step Summary can render a fix-preview
+          # table even when enforcement is warn-only. Format per entry:
+          # "filename|retired-label|suggested-unified-label" (pipe-delimited,
+          # safe because filenames/labels never contain '|' in this repo set).
+          RETIRED_ARCH_PINNED_VIOLATIONS=()
+
+          if command -v python3 >/dev/null 2>&1; then
+            REPO_VISIBILITY="$(
+              python3 -c 'import json, os, sys, urllib.request; repo=os.environ.get("GITHUB_REPOSITORY"); token=os.environ.get("GITHUB_TOKEN"); sys.exit(0) if not repo or not token else None; req=urllib.request.Request(f"https://api.github.com/repos/{repo}", headers={"Accept":"application/vnd.github+json","Authorization":f"Bearer {token}","X-GitHub-Api-Version":"2022-11-28","User-Agent":"runner-policy-check"}); data=json.load(urllib.request.urlopen(req, timeout=20)); print(data.get("visibility") or ("private" if data.get("private") else "public"))'
+            )"
+          fi
+
+          # Parse default allowed runners from policy
+          DEFAULT_ALLOWED=()
+          in_default=false
+          while IFS= read -r line; do
+            line="${line%$'\r'}"  # strip trailing \r
+            if [[ "$line" =~ default_allowed: ]]; then
+              in_default=true
+              continue
+            fi
+            if $in_default; then
+              if [[ "$line" =~ ^[[:space:]]*-[[:space:]] ]]; then
+                runner=$(echo "$line" | sed 's/^[[:space:]]*- //' | sed 's/[[:space:]]*#.*//' | tr -d '"')
+                DEFAULT_ALLOWED+=("$runner")
+              elif [[ "$line" =~ ^[[:space:]]*# ]] || [[ -z "$line" ]]; then
+                continue  # skip comments and blank lines
+              else
+                break
+              fi
+            fi
+          done < "$POLICY"
+
+          # Parse allowed runner groups from policy
+          ALLOWED_GROUPS=()
+          in_allowed_groups=false
+          while IFS= read -r line; do
+            line="${line%$'\r'}"  # strip trailing \r
+            if [[ "$line" =~ allowed_groups: ]]; then
+              in_allowed_groups=true
+              continue
+            fi
+            if $in_allowed_groups; then
+              if [[ "$line" =~ ^[[:space:]]*-[[:space:]] ]]; then
+                group=$(echo "$line" | sed 's/^[[:space:]]*- //' | sed 's/[[:space:]]*#.*//' | tr -d '"')
+                ALLOWED_GROUPS+=("$group")
+              elif [[ "$line" =~ ^[[:space:]]*# ]] || [[ -z "$line" ]]; then
+                continue  # skip comments and blank lines
+              else
+                break
+              fi
+            fi
+          done < "$POLICY"
+
+          # Parse repo-specific exceptions
+          REPO_EXCEPTIONS=()
+          in_exceptions=false
+          in_repo=false
+          while IFS= read -r line; do
+            line="${line%$'\r'}"  # strip trailing \r
+            if [[ "$line" =~ exceptions: ]]; then
+              in_exceptions=true
+              continue
+            fi
+            if $in_exceptions; then
+              # Skip comments and blank lines
+              trimmed=$(echo "$line" | sed 's/^[[:space:]]*//')
+              if [[ -z "$trimmed" ]] || [[ "$trimmed" == "#"* ]]; then
+                continue
+              fi
+              # New top-level key ends exceptions block
+              if [[ ! "$line" =~ ^[[:space:]] ]]; then
+                break
+              fi
+              # Check for repo name match (indented key ending with colon)
+              if [[ "$trimmed" == "${REPO_NAME}:" ]]; then
+                in_repo=true
+                continue
+              elif [[ "$trimmed" =~ ^[A-Za-z].*:$ ]] && $in_repo; then
+                in_repo=false
+                continue
+              fi
+              if $in_repo && [[ "$line" =~ ^[[:space:]]*-[[:space:]] ]]; then
+                runner=$(echo "$line" | sed 's/^[[:space:]]*- //' | sed 's/[[:space:]]*#.*//' | tr -d '"')
+                REPO_EXCEPTIONS+=("$runner")
+              fi
+            fi
+          done < "$POLICY"
+
+          # Parse whether private repos default to Stratus self-hosted runners.
+          PRIVATE_REPOS_DEFAULT_SELF_HOSTED=false
+          while IFS= read -r line; do
+            line="${line%$'\r'}"
+            if [[ "$line" =~ private_repos_default_self_hosted:[[:space:]]*(.*)$ ]]; then
+              value=$(echo "${BASH_REMATCH[1]}" | sed 's/[[:space:]]*#.*//' | tr -d '"' | xargs)
+              if [[ "$value" == "true" ]]; then
+                PRIVATE_REPOS_DEFAULT_SELF_HOSTED=true
+              fi
+              break
+            fi
+          done < "$POLICY"
+
+          # Parse private repos that remain GitHub-hosted-primary.
+          GITHUB_HOSTED_PRIMARY_PRIVATE_REPOS=()
+          in_private_opt_outs=false
+          while IFS= read -r line; do
+            line="${line%$'\r'}"
+            if [[ "$line" =~ github_hosted_primary_private_repos: ]]; then
+              in_private_opt_outs=true
+              continue
+            fi
+            if $in_private_opt_outs; then
+              trimmed=$(echo "$line" | sed 's/^[[:space:]]*//')
+              if [[ -z "$trimmed" ]] || [[ "$trimmed" == "#"* ]]; then
+                continue
+              fi
+              if [[ ! "$line" =~ ^[[:space:]] ]]; then
+                break
+              fi
+              if [[ "$line" =~ ^[[:space:]]*-[[:space:]] ]]; then
+                repo=$(echo "$line" | sed 's/^[[:space:]]*- //' | sed 's/[[:space:]]*#.*//' | tr -d '"')
+                GITHUB_HOSTED_PRIMARY_PRIVATE_REPOS+=("$repo")
+              fi
+            fi
+          done < "$POLICY"
+
+          SELF_HOSTED_PRIMARY=false
+          if [[ "$REPO_VISIBILITY" != "public" && "$PRIVATE_REPOS_DEFAULT_SELF_HOSTED" == "true" ]]; then
+            SELF_HOSTED_PRIMARY=true
+          fi
+          for repo in "${GITHUB_HOSTED_PRIMARY_PRIVATE_REPOS[@]}"; do
+            if [[ "$repo" == "$REPO_NAME" ]]; then
+              SELF_HOSTED_PRIMARY=false
+              break
+            fi
+          done
+
+          # Parse GitHub-hosted workflow exceptions for self-hosted-primary repos.
+          GLOBAL_GITHUB_HOSTED_EXCEPTION_WORKFLOWS=()
+          GITHUB_HOSTED_EXCEPTION_WORKFLOWS=()
+          current_hosted_exception_scope=""
+          in_hosted_exceptions=false
+          while IFS= read -r line; do
+            line="${line%$'\r'}"
+            if [[ "$line" =~ github_hosted_exceptions: ]]; then
+              in_hosted_exceptions=true
+              continue
+            fi
+            if $in_hosted_exceptions; then
+              trimmed=$(echo "$line" | sed 's/^[[:space:]]*//')
+              if [[ -z "$trimmed" ]] || [[ "$trimmed" == "#"* ]]; then
+                continue
+              fi
+              if [[ ! "$line" =~ ^[[:space:]] ]]; then
+                break
+              fi
+              if [[ "$trimmed" =~ ^[A-Za-z0-9._-]+:$ ]]; then
+                current_hosted_exception_scope="${trimmed%:}"
+                continue
+              fi
+              if [[ "$line" =~ ^[[:space:]]*-[[:space:]] ]]; then
+                workflow=$(echo "$line" | sed 's/^[[:space:]]*- //' | sed 's/[[:space:]]*#.*//' | tr -d '"')
+                if [[ "$current_hosted_exception_scope" == "_global" ]]; then
+                  GLOBAL_GITHUB_HOSTED_EXCEPTION_WORKFLOWS+=("$workflow")
+                elif [[ "$current_hosted_exception_scope" == "$REPO_NAME" ]]; then
+                  GITHUB_HOSTED_EXCEPTION_WORKFLOWS+=("$workflow")
+                fi
+              fi
+            fi
+          done < "$POLICY"
+
+          # Parse per-repo workflows that must route through the hybrid runner router.
+          HYBRID_OVERFLOW_WORKFLOWS=()
+          in_hybrid_overflow=false
+          in_repo=false
+          while IFS= read -r line; do
+            line="${line%$'\r'}"
+            if [[ "$line" =~ hybrid_overflow_workflows: ]]; then
+              in_hybrid_overflow=true
+              continue
+            fi
+            if $in_hybrid_overflow; then
+              trimmed=$(echo "$line" | sed 's/^[[:space:]]*//')
+              if [[ -z "$trimmed" ]] || [[ "$trimmed" == "#"* ]]; then
+                continue
+              fi
+              if [[ ! "$line" =~ ^[[:space:]] ]]; then
+                break
+              fi
+              if [[ "$trimmed" == "${REPO_NAME}:" ]]; then
+                in_repo=true
+                continue
+              elif [[ "$trimmed" =~ ^[A-Za-z0-9._-]+:$ ]] && $in_repo; then
+                in_repo=false
+                continue
+              fi
+              if $in_repo && [[ "$line" =~ ^[[:space:]]*-[[:space:]] ]]; then
+                workflow=$(echo "$line" | sed 's/^[[:space:]]*- //' | sed 's/[[:space:]]*#.*//' | tr -d '"')
+                HYBRID_OVERFLOW_WORKFLOWS+=("$workflow")
+              fi
+            fi
+          done < "$POLICY"
+
+          # Parse repo-local runner-router routing policy entries when present.
+          ROUTING_POLICY_PRESENT=false
+          ROUTING_POLICY_WORKFLOWS=()
+          if [[ -f .github/runner-routing-policy.json ]] && command -v python3 >/dev/null 2>&1; then
+            ROUTING_POLICY_PRESENT=true
+            while IFS= read -r workflow; do
+              [[ -n "$workflow" ]] || continue
+              ROUTING_POLICY_WORKFLOWS+=("$workflow")
+            done < <(REPO_NAME="$REPO_NAME" python3 -c 'import json, os, pathlib; policy=json.loads(pathlib.Path(".github/runner-routing-policy.json").read_text(encoding="utf-8")); workflows=policy.get("repos", {}).get(os.environ["REPO_NAME"], {}).get("workflows", {}) or {}; [print(str(name).strip()) for name in workflows]')
+          fi
+
+          # ------------------------------------------------------------------
+          # Unified-scheduling policy (infra#2380 Phase 5).
+          # Parses /tmp/runner-policy-exceptions.yml to enforce arch-agnostic
+          # tier labels and reject deprecated arch-pinned labels unless a
+          # workflow is allowlisted.
+          # ------------------------------------------------------------------
+          EXCEPTIONS_POLICY="/tmp/runner-policy-exceptions.yml"
+          UNIFIED_ENFORCEMENT_ENABLED=false
+          DEPRECATED_ARCH_PINNED_LABELS=()
+          UNIFIED_TIER_LABELS=()
+          # Parallel arrays: UNIFIED_EXCEPTION_WORKFLOWS[i] pairs with
+          # UNIFIED_EXCEPTION_ALLOWED[i] as a pipe-delimited label list.
+          UNIFIED_EXCEPTION_WORKFLOWS=()
+          UNIFIED_EXCEPTION_ALLOWED=()
+
+          if [[ -f "$EXCEPTIONS_POLICY" ]]; then
+            # enforcement_enabled: top-level scalar
+            while IFS= read -r line; do
+              line="${line%$'\r'}"
+              if [[ "$line" =~ ^enforcement_enabled:[[:space:]]*(.*)$ ]]; then
+                value=$(echo "${BASH_REMATCH[1]}" | sed 's/[[:space:]]*#.*//' | tr -d '"' | xargs)
+                if [[ "$value" == "true" ]]; then
+                  UNIFIED_ENFORCEMENT_ENABLED=true
+                fi
+                break
+              fi
+            done < "$EXCEPTIONS_POLICY"
+
+            # deprecated_arch_pinned_labels: list
+            in_block=false
+            while IFS= read -r line; do
+              line="${line%$'\r'}"
+              if [[ "$line" =~ ^deprecated_arch_pinned_labels: ]]; then
+                in_block=true
+                continue
+              fi
+              if $in_block; then
+                trimmed=$(echo "$line" | sed 's/^[[:space:]]*//')
+                if [[ -z "$trimmed" ]] || [[ "$trimmed" == "#"* ]]; then
+                  continue
+                fi
+                if [[ ! "$line" =~ ^[[:space:]] ]]; then
+                  break
+                fi
+                if [[ "$line" =~ ^[[:space:]]*-[[:space:]] ]]; then
+                  label=$(echo "$line" | sed 's/^[[:space:]]*- //' | sed 's/[[:space:]]*#.*//' | tr -d '"')
+                  DEPRECATED_ARCH_PINNED_LABELS+=("$label")
+                fi
+              fi
+            done < "$EXCEPTIONS_POLICY"
+
+            # unified_tier_labels: list (informational — used in failure messages)
+            in_block=false
+            while IFS= read -r line; do
+              line="${line%$'\r'}"
+              if [[ "$line" =~ ^unified_tier_labels: ]]; then
+                in_block=true
+                continue
+              fi
+              if $in_block; then
+                trimmed=$(echo "$line" | sed 's/^[[:space:]]*//')
+                if [[ -z "$trimmed" ]] || [[ "$trimmed" == "#"* ]]; then
+                  continue
+                fi
+                if [[ ! "$line" =~ ^[[:space:]] ]]; then
+                  break
+                fi
+                if [[ "$line" =~ ^[[:space:]]*-[[:space:]] ]]; then
+                  label=$(echo "$line" | sed 's/^[[:space:]]*- //' | sed 's/[[:space:]]*#.*//' | tr -d '"')
+                  UNIFIED_TIER_LABELS+=("$label")
+                fi
+              fi
+            done < "$EXCEPTIONS_POLICY"
+
+            # exceptions: list of mappings
+            #   - workflow: <path>
+            #     reason: "..."
+            #     allowed_labels:
+            #       - <label>
+            # Parse into two parallel arrays.
+            in_block=false
+            current_wf=""
+            current_labels=""
+            in_allowed=false
+            while IFS= read -r line; do
+              line="${line%$'\r'}"
+              if [[ "$line" =~ ^exceptions: ]]; then
+                in_block=true
+                continue
+              fi
+              if $in_block; then
+                # Non-indented, non-empty, non-comment line ends the block.
+                trimmed=$(echo "$line" | sed 's/^[[:space:]]*//')
+                if [[ -z "$trimmed" ]] || [[ "$trimmed" == "#"* ]]; then
+                  continue
+                fi
+                if [[ ! "$line" =~ ^[[:space:]] ]]; then
+                  # flush in-flight entry
+                  if [[ -n "$current_wf" ]]; then
+                    UNIFIED_EXCEPTION_WORKFLOWS+=("$current_wf")
+                    UNIFIED_EXCEPTION_ALLOWED+=("${current_labels#|}")
+                    current_wf=""
+                    current_labels=""
+                    in_allowed=false
+                  fi
+                  break
+                fi
+
+                # Start of a new list item: "  - workflow: ..."
+                if [[ "$trimmed" =~ ^-[[:space:]]+workflow:[[:space:]]*(.*)$ ]]; then
+                  # Flush previous entry
+                  if [[ -n "$current_wf" ]]; then
+                    UNIFIED_EXCEPTION_WORKFLOWS+=("$current_wf")
+                    UNIFIED_EXCEPTION_ALLOWED+=("${current_labels#|}")
+                  fi
+                  current_wf=$(echo "${BASH_REMATCH[1]}" | sed 's/[[:space:]]*#.*//' | tr -d '"')
+                  current_labels=""
+                  in_allowed=false
+                  continue
+                fi
+
+                # "workflow:" on its own line (alt form)
+                if [[ "$trimmed" =~ ^workflow:[[:space:]]*(.*)$ ]]; then
+                  current_wf=$(echo "${BASH_REMATCH[1]}" | sed 's/[[:space:]]*#.*//' | tr -d '"')
+                  in_allowed=false
+                  continue
+                fi
+
+                # "allowed_labels:" begins a nested list
+                if [[ "$trimmed" =~ ^allowed_labels: ]]; then
+                  in_allowed=true
+                  continue
+                fi
+
+                # Any other `key:` line closes the allowed_labels list
+                if [[ "$trimmed" =~ ^[a-zA-Z_]+: ]]; then
+                  in_allowed=false
+                  continue
+                fi
+
+                # Label list items under allowed_labels
+                if $in_allowed && [[ "$trimmed" =~ ^-[[:space:]]+(.*)$ ]]; then
+                  label=$(echo "${BASH_REMATCH[1]}" | sed 's/[[:space:]]*#.*//' | tr -d '"' | xargs)
+                  if [[ -n "$label" ]]; then
+                    current_labels+="|$label"
+                  fi
+                fi
+              fi
+            done < "$EXCEPTIONS_POLICY"
+            # Flush final in-flight entry after loop
+            if [[ -n "$current_wf" ]]; then
+              UNIFIED_EXCEPTION_WORKFLOWS+=("$current_wf")
+              UNIFIED_EXCEPTION_ALLOWED+=("${current_labels#|}")
+            fi
+          fi
+
+          # Combine allowed runners
+          ALL_ALLOWED=("${DEFAULT_ALLOWED[@]}" "${REPO_EXCEPTIONS[@]}")
+
+          echo "=== Runner Policy Check ==="
+          echo "Repository: $REPO_NAME"
+          echo "Visibility: $REPO_VISIBILITY"
+          echo "Default allowed: ${DEFAULT_ALLOWED[*]}"
+          if [ ${#ALLOWED_GROUPS[@]} -gt 0 ]; then
+            echo "Allowed groups: ${ALLOWED_GROUPS[*]}"
+          fi
+          if [ ${#REPO_EXCEPTIONS[@]} -gt 0 ]; then
+            echo "Repo exceptions: ${REPO_EXCEPTIONS[*]}"
+          fi
+          if [[ "$SELF_HOSTED_PRIMARY" == "true" ]]; then
+            echo "Self-hosted primary: true"
+            if [ ${#GITHUB_HOSTED_PRIMARY_PRIVATE_REPOS[@]} -gt 0 ]; then
+              echo "GitHub-hosted-primary private repo opt-outs: ${GITHUB_HOSTED_PRIMARY_PRIVATE_REPOS[*]}"
+            fi
+            if [ ${#GITHUB_HOSTED_EXCEPTION_WORKFLOWS[@]} -gt 0 ]; then
+              echo "GitHub-hosted workflow exceptions: ${GITHUB_HOSTED_EXCEPTION_WORKFLOWS[*]}"
+            fi
+            if [ ${#GLOBAL_GITHUB_HOSTED_EXCEPTION_WORKFLOWS[@]} -gt 0 ]; then
+              echo "Global GitHub-hosted workflow exceptions: ${GLOBAL_GITHUB_HOSTED_EXCEPTION_WORKFLOWS[*]}"
+            fi
+            if [ ${#HYBRID_OVERFLOW_WORKFLOWS[@]} -gt 0 ]; then
+              echo "Hybrid overflow workflows: ${HYBRID_OVERFLOW_WORKFLOWS[*]}"
+            fi
+          fi
+          echo "Unified scheduling (infra#2380 Phase 5): enforcement_enabled=$UNIFIED_ENFORCEMENT_ENABLED"
+          if [ ${#DEPRECATED_ARCH_PINNED_LABELS[@]} -gt 0 ]; then
+            echo "Deprecated arch-pinned labels: ${DEPRECATED_ARCH_PINNED_LABELS[*]}"
+          fi
+          if [ ${#UNIFIED_EXCEPTION_WORKFLOWS[@]} -gt 0 ]; then
+            echo "Unified-scheduling exceptions: ${#UNIFIED_EXCEPTION_WORKFLOWS[@]} allowlisted workflow(s)"
+          fi
+          echo ""
+
+          # Current workflow file being scanned (set in the loop below).
+          # Used by get_matrix_values() and is_allowed().
+          CURRENT_WORKFLOW=""
+
+          # Resolve all concrete values for a matrix key from CURRENT_WORKFLOW.
+          # Reads every "KEY: VALUE" line inside any `matrix:` block in the file.
+          get_matrix_values() {
+            local key="$1"
+            local in_matrix=false
+            local matrix_indent=-1
+
+            while IFS= read -r mline; do
+              mline="${mline%$'\r'}"
+              local mtrimmed
+              mtrimmed=$(echo "$mline" | sed 's/^[[:space:]]*//')
+              [[ "$mtrimmed" == "#"* || -z "$mtrimmed" ]] && continue
+              local mleading="${mline%%[^[:space:]]*}"
+              local mindent=${#mleading}
+
+              if [[ "$mtrimmed" == "matrix:" ]]; then
+                in_matrix=true
+                matrix_indent=$mindent
+                continue
+              fi
+
+              if $in_matrix; then
+                # A non-list key at same/lower indent closes the matrix block
+                if [[ $mindent -le $matrix_indent && -n "$mtrimmed" && ! "$mtrimmed" =~ ^- ]]; then
+                  in_matrix=false
+                  matrix_indent=-1
+                  continue
+                fi
+                # Emit value for lines matching "KEY: VALUE"
+                if [[ "$mtrimmed" =~ ^${key}:[[:space:]]+(.*) ]]; then
+                  strip_yaml_value "${BASH_REMATCH[1]}"
+                fi
+              fi
+            done < "$CURRENT_WORKFLOW"
+          }
+
+          # Check a concrete (non-template) runner name against the allowlist.
+          _is_literal_allowed() {
+            local runner="$1"
+            for allowed in "${ALL_ALLOWED[@]}"; do
+              [[ "$runner" == "$allowed" ]] && return 0
+            done
+            return 1
+          }
+
+          # Check whether a runs-on value is permitted.
+          #
+          # Three categories:
+          #   1. workflow_call inputs (inputs.*) - truly dynamic, always allowed.
+          #   2. matrix expressions (matrix.KEY) - resolve the matrix values
+          #      statically from the workflow file and validate each concrete value.
+          #      Violations are added directly to VIOLATIONS[].
+          #   3. All other template expressions - allowed with a warning (env vars,
+          #      conditional expressions, etc. that cannot be resolved statically).
+          #   4. Literal strings - checked against the allowlist.
+          is_allowed() {
+            local runner="$1"
+
+            # 1. workflow_call inputs — resolved at call time, cannot validate statically
+            if [[ "$runner" =~ \$\{\{[[:space:]]*inputs\. ]]; then
+              return 0
+            fi
+
+            # 2. Matrix expressions — extract all matrix.KEY names, resolve concrete
+            #    values from the workflow file, validate each.
+            if [[ "$runner" == *'${'*'matrix.'* ]]; then
+              # Extract every matrix.KEY referenced in the expression
+              local keys=()
+              local tmp="$runner"
+              while [[ "$tmp" =~ matrix\.([a-zA-Z_][a-zA-Z0-9_-]*) ]]; do
+                keys+=("${BASH_REMATCH[1]}")
+                tmp="${tmp#*matrix.${BASH_REMATCH[1]}}"
+              done
+
+              if [[ ${#keys[@]} -eq 0 ]]; then
+                # Unrecognised matrix pattern — allow
+                return 0
+              fi
+
+              local found_any_values=false
+              local all_ok=true
+
+              for key in "${keys[@]}"; do
+                local resolved_vals
+                resolved_vals=$(get_matrix_values "$key")
+                while IFS= read -r val; do
+                  [[ -z "$val" ]] && continue
+                  found_any_values=true
+                  if ! _is_literal_allowed "$val"; then
+                    VIOLATIONS+=("$(basename "$CURRENT_WORKFLOW"): matrix.$key resolves to unapproved runner '$val'")
+                    all_ok=false
+                  fi
+                  # Unified-scheduling enforcement also applies to matrix-
+                  # resolved values (infra#2380 Phase 5).
+                  check_unified_policy "$(basename "$CURRENT_WORKFLOW")" "$val"
+                done <<< "$resolved_vals"
+              done
+
+              if [[ "$found_any_values" == "false" ]]; then
+                # No concrete values found — warn and allow
+                echo "::warning::file=$(basename "$CURRENT_WORKFLOW")::Cannot statically resolve matrix runner expression '$runner' — ensure matrix values comply with runner policy"
+                return 0
+              fi
+
+              [[ "$all_ok" == "true" ]] && return 0 || return 1
+            fi
+
+            # 3. Other template expressions (env vars, conditionals, etc.) — allow with warning
+            if [[ "$runner" == *'${'* ]]; then
+              echo "::warning::file=$(basename "$CURRENT_WORKFLOW")::Non-matrix template expression '$runner' cannot be validated statically"
+              return 0
+            fi
+
+            # 4. Literal runner name — check allowlist
+            _is_literal_allowed "$runner"
+          }
+
+          is_group_allowed() {
+            local group="$1"
+
+            if [[ "$group" == *'${'* ]]; then
+              return 0
+            fi
+
+            for allowed in "${ALLOWED_GROUPS[@]}"; do
+              if [[ "$group" == "$allowed" ]]; then
+                return 0
+              fi
+            done
+
+            return 1
+          }
+
+          strip_yaml_value() {
+            echo "$1" | sed 's/[[:space:]]*#.*//' | tr -d "'\"" | xargs
+          }
+
+          is_github_hosted() {
+            local runner="$1"
+            [[ "$runner" =~ ^(ubuntu|macos|windows)- ]]
+          }
+
+          is_github_hosted_exception_workflow() {
+            local filename="$1"
+            for exception_workflow in "${GLOBAL_GITHUB_HOSTED_EXCEPTION_WORKFLOWS[@]}"; do
+              [[ "$filename" == "$exception_workflow" ]] && return 0
+            done
+            for exception_workflow in "${GITHUB_HOSTED_EXCEPTION_WORKFLOWS[@]}"; do
+              [[ "$filename" == "$exception_workflow" ]] && return 0
+            done
+            return 1
+          }
+
+          is_hybrid_overflow_expression() {
+            local runner="$1"
+            [[ "$runner" =~ ^\$\{\{[[:space:]]*needs\.[A-Za-z0-9_-]+\.outputs\.target_runner[[:space:]]*\}\}$ ]]
+          }
+
+          is_hybrid_overflow_workflow() {
+            local filename="$1"
+            for listed_workflow in "${HYBRID_OVERFLOW_WORKFLOWS[@]}"; do
+              [[ "$filename" == "$listed_workflow" ]] && return 0
+            done
+            return 1
+          }
+
+          routing_policy_has_workflow() {
+            local filename="$1"
+            for listed_workflow in "${ROUTING_POLICY_WORKFLOWS[@]}"; do
+              [[ "$filename" == "$listed_workflow" ]] && return 0
+            done
+            return 1
+          }
+
+          workflow_calls_runner_router() {
+            grep -Eq '^[[:space:]]*uses:[[:space:]]+.*runner-router\.yml(@[^[:space:]]*)?[[:space:]]*$' "$CURRENT_WORKFLOW"
+          }
+
+          workflow_uses_capability_routing() {
+            grep -Eq '^[[:space:]]*(arch|tier|docker|platform|isolation|purpose):[[:space:]]+' "$CURRENT_WORKFLOW"
+          }
+
+          workflow_uses_hybrid_target_runner() {
+            grep -Eq '^[[:space:]]*runs-on:[[:space:]]*\$\{\{[[:space:]]*needs\.[A-Za-z0-9_-]+\.outputs\.target_runner[[:space:]]*\}\}[[:space:]]*$' "$CURRENT_WORKFLOW"
+          }
+
+          check_required_hybrid_overflow_wiring() {
+            local filename="$1"
+
+            if ! is_hybrid_overflow_workflow "$filename"; then
+              return
+            fi
+
+            if ! workflow_calls_runner_router; then
+              VIOLATIONS+=("$filename: listed in hybrid_overflow_workflows but does not call runner-router.yml")
+            fi
+
+            if ! workflow_uses_hybrid_target_runner; then
+              VIOLATIONS+=("$filename: listed in hybrid_overflow_workflows but no job uses needs.<route>.outputs.target_runner")
+            fi
+          }
+
+          check_required_routing_policy_entry() {
+            local filename="$1"
+
+            if [[ "$ROUTING_POLICY_PRESENT" != "true" ]]; then
+              return
+            fi
+
+            if workflow_calls_runner_router && ! routing_policy_has_workflow "$filename"; then
+              if workflow_uses_capability_routing; then
+                return
+              fi
+              VIOLATIONS+=("$filename: calls runner-router.yml but is missing from .github/runner-routing-policy.json")
+            fi
+          }
+
+          # ------------------------------------------------------------------
+          # Unified-scheduling helpers (infra#2380 Phase 5).
+          # ------------------------------------------------------------------
+
+          # Is `runner` in the deprecated arch-pinned list?
+          is_deprecated_arch_pinned() {
+            local runner="$1"
+            for bad in "${DEPRECATED_ARCH_PINNED_LABELS[@]}"; do
+              [[ "$runner" == "$bad" ]] && return 0
+            done
+            return 1
+          }
+
+          # Does the current workflow+label combination match an allowlist entry?
+          #   $1 = workflow-relative filename (e.g. build-arc-runner.yml)
+          #   $2 = runner label
+          # Matches on the workflow path suffix so both absolute org paths
+          # (Scheduler-Systems/stratus/.github/workflows/foo.yml) and bare
+          # filenames resolve correctly — the canonical allowlist uses the
+          # full org path; we match if the allowlist path ends with the
+          # current repo's `.github/workflows/<filename>`.
+          is_unified_exception_allowed() {
+            local filename="$1"
+            local runner="$2"
+            local suffix="${REPO_NAME}/.github/workflows/${filename}"
+            local i=0
+            while [[ $i -lt ${#UNIFIED_EXCEPTION_WORKFLOWS[@]} ]]; do
+              local entry_wf="${UNIFIED_EXCEPTION_WORKFLOWS[$i]}"
+              if [[ "$entry_wf" == *"$suffix" ]]; then
+                local entry_labels="${UNIFIED_EXCEPTION_ALLOWED[$i]}"
+                # Split pipe-delimited label list
+                IFS='|' read -ra labels_array <<< "$entry_labels"
+                for label in "${labels_array[@]}"; do
+                  [[ "$runner" == "$label" ]] && return 0
+                done
+              fi
+              i=$((i + 1))
+            done
+            return 1
+          }
+
+          # Map a deprecated arch-pinned label to its unified tier replacement
+          # for a clearer error message. Returns the unified label or empty.
+          unified_tier_for() {
+            local runner="$1"
+            case "$runner" in
+              ci-standard-runc-x64|ci-standard-vz-arm64)     echo "ci-standard" ;;
+              ci-medium-runc-x64|ci-medium-vz-arm64)         echo "ci-medium" ;;
+              ci-high-runc-x64|ci-high-vz-arm64)             echo "ci-high" ;;
+              agents-standard-runc-x64|agents-standard-vz-arm64) echo "agents-standard" ;;
+              agents-medium-runc-x64|agents-medium-vz-arm64) echo "agents-medium" ;;
+              agents-high-runc-x64|agents-high-vz-arm64)     echo "agents-high" ;;
+              docker-standard-dind-x64)                      echo "docker-standard-dind" ;;
+              docker-medium-dind-x64)                        echo "docker-medium-dind" ;;
+              docker-high-dind-x64)                          echo "docker-high-dind" ;;
+              *)                                             echo "" ;;
+            esac
+          }
+
+          # Core unified-scheduling enforcement. Gated on
+          # UNIFIED_ENFORCEMENT_ENABLED; when false, logs a warning but does
+          # not add a violation. When true, adds a violation unless the
+          # workflow+label pair matches the allowlist.
+          check_unified_policy() {
+            local filename="$1"
+            local runner="$2"
+
+            if ! is_deprecated_arch_pinned "$runner"; then
+              return
+            fi
+
+            if is_unified_exception_allowed "$filename" "$runner"; then
+              return
+            fi
+
+            local suggest
+            suggest=$(unified_tier_for "$runner")
+            local msg="deprecated arch-pinned runner '$runner' (infra#2380)"
+            if [[ -n "$suggest" ]]; then
+              msg="$msg — use '$suggest' instead (unified scheduling lets k8s place the pod across amd64+arm64)"
+            fi
+
+            # Track for the Step Summary fix-preview table, regardless of
+            # enforcement mode. The table helps developers apply the one-line
+            # swap manually; this is the non-automated precursor to the bot-PR
+            # in infra#2496.
+            RETIRED_ARCH_PINNED_VIOLATIONS+=("${filename}|${runner}|${suggest}")
+
+            if [[ "$UNIFIED_ENFORCEMENT_ENABLED" == "true" ]]; then
+              VIOLATIONS+=("$filename: $msg")
+            else
+              echo "::warning::file=$filename::$msg — enforcement disabled (set enforcement_enabled=true in github/runner-policy-exceptions.yml to block)"
+            fi
+          }
+
+          check_runner() {
+            local filename="$1"
+            local runner="$2"
+            # For matrix expressions, is_allowed() adds violations directly
+            # (with the resolved concrete values for clearer error messages).
+            if [[ "$runner" == *'${'*'matrix.'* ]]; then
+              is_allowed "$runner" || true
+              return
+            fi
+            if is_hybrid_overflow_expression "$runner"; then
+              if is_hybrid_overflow_workflow "$filename"; then
+                return
+              fi
+              VIOLATIONS+=("$filename: hybrid overflow expression '$runner' is only allowed for workflows listed in hybrid_overflow_workflows")
+              return
+            fi
+            if [[ "$REPO_VISIBILITY" == "public" ]] && ! is_github_hosted "$runner"; then
+              VIOLATIONS+=("$filename: public repos must use GitHub-hosted runners only (found $runner)")
+              return
+            fi
+            if ! is_allowed "$runner"; then
+              VIOLATIONS+=("$filename: $runner")
+              return
+            fi
+            if [[ "$SELF_HOSTED_PRIMARY" == "true" ]] && is_github_hosted "$runner" && ! is_github_hosted_exception_workflow "$filename"; then
+              VIOLATIONS+=("$filename: GitHub-hosted runner '$runner' is not allowed; private repos default to Stratus self-hosted lanes except for explicit control-plane/bootstrap exceptions")
+            fi
+            # Unified-scheduling check runs last: the label already passed the
+            # general allowlist, but may be a deprecated arch-pinned tier.
+            check_unified_policy "$filename" "$runner"
+          }
+
+          check_group() {
+            local filename="$1"
+            local group="$2"
+            if ! is_group_allowed "$group"; then
+              VIOLATIONS+=("$filename: group=$group")
+            fi
+          }
+
+          validate_runs_on_mapping() {
+            local filename="$1"
+            local group="$2"
+            shift 2
+            local labels=("$@")
+
+            if [[ -n "$group" ]]; then
+              check_group "$filename" "$group"
+            fi
+
+            for label in "${labels[@]}"; do
+              [[ -n "$label" ]] || continue
+              check_runner "$filename" "$label"
+            done
+          }
+
+          # Scan all workflow files
+          if [ ! -d .github/workflows ]; then
+            echo "No .github/workflows directory found. Skipping."
+            exit 0
+          fi
+
+          for workflow in .github/workflows/*.yml .github/workflows/*.yaml; do
+            [ -f "$workflow" ] || continue
+
+            filename=$(basename "$workflow")
+
+            # Skip self (contains runs-on in script text)
+            if [[ "$filename" == "runner-policy-check.yml" ]]; then
+              continue
+            fi
+
+            CURRENT_WORKFLOW="$workflow"
+            check_required_routing_policy_entry "$filename"
+            check_required_hybrid_overflow_wiring "$filename"
+
+            in_runs_on_block=false
+            runs_on_indent=0
+            in_labels_list=false
+            labels_indent=0
+            current_group=""
+            current_labels=()
+
+            # Extract runs-on values
+            while IFS= read -r line; do
+              # Skip comment lines
+              trimmed_line=$(echo "$line" | sed 's/^[[:space:]]*//')
+              leading_ws="${line%%[^[:space:]]*}"
+              current_indent=${#leading_ws}
+              if [[ "$trimmed_line" == "#"* ]]; then
+                continue
+              fi
+
+              if $in_runs_on_block; then
+                if [[ -n "$trimmed_line" && $current_indent -le $runs_on_indent ]]; then
+                  validate_runs_on_mapping "$filename" "$current_group" "${current_labels[@]}"
+                  in_runs_on_block=false
+                  in_labels_list=false
+                  current_group=""
+                  current_labels=()
+                else
+                  if $in_labels_list; then
+                    if [[ $current_indent -gt $labels_indent && "$trimmed_line" =~ ^-[[:space:]] ]]; then
+                      label=$(strip_yaml_value "${trimmed_line#- }")
+                      if [[ -n "$label" ]]; then
+                        current_labels+=("$label")
+                      fi
+                      continue
+                    else
+                      in_labels_list=false
+                    fi
+                  fi
+
+                  if $in_runs_on_block; then
+                    if [[ "$trimmed_line" =~ ^group:[[:space:]]*(.*)$ ]]; then
+                      current_group=$(strip_yaml_value "${BASH_REMATCH[1]}")
+                      continue
+                    fi
+
+                    if [[ "$trimmed_line" =~ ^labels:[[:space:]]*(.*)$ ]]; then
+                      labels_raw="${BASH_REMATCH[1]}"
+                      labels_value=$(strip_yaml_value "$labels_raw")
+
+                      if [[ -z "$labels_value" ]]; then
+                        in_labels_list=true
+                        labels_indent=$current_indent
+                        continue
+                      fi
+
+                      if [[ "$labels_value" == \[*\] ]]; then
+                        labels_inline="${labels_value#[}"
+                        labels_inline="${labels_inline%]}"
+                        IFS=',' read -ra labels_array <<< "$labels_inline"
+                        for label in "${labels_array[@]}"; do
+                          label=$(strip_yaml_value "$label")
+                          if [[ -n "$label" ]]; then
+                            current_labels+=("$label")
+                          fi
+                        done
+                      else
+                        current_labels+=("$labels_value")
+                      fi
+                      continue
+                    fi
+
+                    continue
+                  fi
+                fi
+              fi
+
+              if [[ "$line" =~ ^([[:space:]]*)runs-on:[[:space:]]*$ ]]; then
+                in_runs_on_block=true
+                runs_on_indent=${#BASH_REMATCH[1]}
+                in_labels_list=false
+                current_group=""
+                current_labels=()
+                continue
+              fi
+
+              if [[ "$line" =~ runs-on: ]]; then
+                runner=$(strip_yaml_value "$(echo "$line" | sed 's/.*runs-on:[[:space:]]*//')")
+
+                # Skip empty or array-start lines
+                if [[ "$runner" == "[" ]] || [[ -z "$runner" ]]; then
+                  continue
+                fi
+
+                # Handle inline array: [self-hosted, macOS]
+                if [[ "$runner" == \[*\] ]]; then
+                  runner_values="${runner#[}"
+                  runner_values="${runner_values%]}"
+                  IFS=',' read -ra runner_array <<< "$runner_values"
+                  for runner_item in "${runner_array[@]}"; do
+                    runner_item=$(strip_yaml_value "$runner_item")
+                    if [[ -n "$runner_item" ]]; then
+                      check_runner "$filename" "$runner_item"
+                    fi
+                  done
+                  continue
+                fi
+
+                check_runner "$filename" "$runner"
+              fi
+            done < "$workflow"
+
+            if $in_runs_on_block; then
+              validate_runs_on_mapping "$filename" "$current_group" "${current_labels[@]}"
+            fi
+          done
+
+          # Render the retired-label fix-preview as a GitHub Step Summary. The
+          # suggested one-line swap lets developers apply the fix without
+          # scrolling the run log. Rendered in both enforce and warn-only
+          # modes; a future iteration (infra#2496) replaces this preview with
+          # an auto-opened PR. Guarded: only writes when $GITHUB_STEP_SUMMARY
+          # is set (always set in Actions, but defensive for local test).
+          if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]] && [ ${#RETIRED_ARCH_PINNED_VIOLATIONS[@]} -gt 0 ]; then
+            {
+              echo "### Retired arch-pinned runners detected (infra#2380)"
+              echo ""
+              if [[ "$UNIFIED_ENFORCEMENT_ENABLED" == "true" ]]; then
+                echo "These violations **block** this check. Apply the swap below, commit, and re-run."
+              else
+                echo "Enforcement is warn-only for \`${REPO_NAME}\`. These will start blocking once \`enforcement_enabled: true\` is set in \`github/runner-policy-exceptions.yml\`."
+              fi
+              echo ""
+              echo "| Workflow | Retired label | Suggested unified label | One-line swap |"
+              echo "| --- | --- | --- | --- |"
+              for entry in "${RETIRED_ARCH_PINNED_VIOLATIONS[@]}"; do
+                IFS='|' read -r ent_file ent_runner ent_suggest <<< "$entry"
+                if [[ -n "$ent_suggest" ]]; then
+                  echo "| \`${ent_file}\` | \`${ent_runner}\` | \`${ent_suggest}\` | \`perl -pi -e 's/\b${ent_runner}\b/${ent_suggest}/g' ${ent_file}\` |"
+                else
+                  echo "| \`${ent_file}\` | \`${ent_runner}\` | _no 1:1 mapping_ | _pick a tier from the list below_ |"
+                fi
+              done
+              echo ""
+              echo "**Unified tiers** — \`ci-standard\`, \`ci-medium\`, \`ci-high\`, \`agents-standard\`, \`agents-medium\`, \`agents-high\`, \`security-standard\`, \`docker-standard-dind\`, \`docker-medium-dind\`, \`docker-high-dind\`."
+              echo ""
+              echo "**Why.** Arch-pinned scale sets are being retired. Unified tiers let Kubernetes place pods across amd64+arm64, so jobs don't queue against a scale set with \`maxRunners: 0\`."
+              echo ""
+              echo "**Legitimate arch-pin?** Add an entry to [\`github/runner-policy-exceptions.yml\`](https://github.com/scheduler-systems/stratus/blob/main/github/runner-policy-exceptions.yml)."
+              echo ""
+              echo "**Tracker:** [infra#2380](https://github.com/Scheduler-Systems/stratus/issues/2380) — auto-PR follow-up in [infra#2496](https://github.com/Scheduler-Systems/stratus/issues/2496)."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Persist retired-label violations for the optional auto-fix bot
+          # (Slice 2 of infra#2496). The bot runs in a subsequent step with a
+          # fresh shell and cannot see in-memory bash arrays. Written even
+          # when empty so downstream steps can rely on the file existing.
+          if [ ${#RETIRED_ARCH_PINNED_VIOLATIONS[@]} -gt 0 ]; then
+            printf '%s\n' "${RETIRED_ARCH_PINNED_VIOLATIONS[@]}" > /tmp/retired-violations.txt
+          else
+            : > /tmp/retired-violations.txt
+          fi
+
+          # Report results
+          if [ ${#VIOLATIONS[@]} -gt 0 ]; then
+            echo "::error::Runner policy violations found!"
+            echo ""
+            echo "The following workflows use runners not allowed by org policy:"
+            echo ""
+            for v in "${VIOLATIONS[@]}"; do
+              echo "  - $v"
+            done
+            echo ""
+            echo "Allowed runners for '$REPO_NAME':"
+            for a in "${ALL_ALLOWED[@]}"; do
+              echo "  - $a"
+            done
+            echo ""
+            echo "To add an exception, update: https://github.com/scheduler-systems/stratus/blob/main/github/runner-policy.yml"
+            echo "Then update the embedded policy in: .github/workflows/runner-policy-check.yml"
+            echo ""
+            echo "For unified-scheduling (infra#2380) violations, update: https://github.com/scheduler-systems/stratus/blob/main/github/runner-policy-exceptions.yml"
+            echo "Unified tier replacements: ci-standard, ci-medium, ci-high, agents-standard, agents-medium, agents-high, security-standard, docker-standard-dind, docker-medium-dind, docker-high-dind"
+            exit 1
+          else
+            echo "All workflows comply with runner policy."
+          fi
+
+      # ---------------------------------------------------------------
+      # Slice 2 of infra#2496: auto-fix bot for retired arch-pinned labels.
+      #
+      # Silent no-op until a GitHub App is provisioned and RUNNER_POLICY_APP_ID
+      # / RUNNER_POLICY_APP_PRIVATE_KEY are set as org-level secrets. Until
+      # then, only the Step Summary fix preview (Slice 1) is rendered.
+      #
+      # GITHUB_TOKEN cannot modify .github/workflows/*.yml under any
+      # permissions-block configuration — GitHub restricts the `workflow`
+      # scope to PATs and GitHub App installation tokens. Hence the App.
+      #
+      # Scope limits for v1:
+      #  - pull_request events only (not push/schedule)
+      #  - not drafts (avoid churn on work-in-progress PRs)
+      #  - same-repo head (forks lack a writable head branch for the App)
+      #  - at least one violation with a 1:1 unified mapping
+      # ---------------------------------------------------------------
+
+      - name: Auto-fix gate (runner-policy bot)
+        id: autofix_gate
+        if: ${{ !cancelled() }}
+        env:
+          # Accept either the dedicated RUNNER_POLICY_* names OR the
+          # pre-existing STRATUS_* names from `build-arc-runner.yml` +
+          # `runner-router.yml`. Reusing STRATUS_* lets callers activate
+          # the bot without duplicating the App's PEM into a second org
+          # secret; dedicated names are supported for orgs that prefer
+          # blast-radius isolation. See infra#2496 for the tradeoff.
+          APP_ID: ${{ vars.RUNNER_POLICY_APP_ID || vars.STRATUS_APP_ID }}
+          HAS_APP_ID: ${{ (vars.RUNNER_POLICY_APP_ID != '' || vars.STRATUS_APP_ID != '') }}
+          HAS_APP_KEY: ${{ (secrets.RUNNER_POLICY_PRIVATE_KEY != '' || secrets.STRATUS_PRIVATE_KEY != '') }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.event.pull_request.base.repo.full_name }}
+        run: |
+          set -euo pipefail
+          disable() { echo "enabled=false" >> "$GITHUB_OUTPUT"; exit 0; }
+
+          if [[ "$HAS_APP_ID" != "true" || "$HAS_APP_KEY" != "true" ]]; then
+            echo "::notice::runner-policy bot App not provisioned — skipping auto-fix (Step Summary preview remains). See infra#2496."
+            disable
+          fi
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            disable
+          fi
+          if [[ "$PR_DRAFT" == "true" ]]; then
+            echo "::notice::Skipping auto-fix: PR is a draft"
+            disable
+          fi
+          if [[ "$HEAD_REPO" != "$BASE_REPO" ]]; then
+            echo "::notice::Skipping auto-fix: PR head ($HEAD_REPO) is a fork of $BASE_REPO (bot v1 only supports same-repo PRs)"
+            disable
+          fi
+          if [[ ! -s /tmp/retired-violations.txt ]]; then
+            disable
+          fi
+          # Require at least one violation with a non-empty suggestion.
+          if ! awk -F'|' 'NF>=3 && $3!=""{found=1} END{exit !found}' /tmp/retired-violations.txt; then
+            echo "::notice::No retired labels with 1:1 unified-tier mapping — nothing for bot to auto-fix"
+            disable
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - name: Mint runner-policy-bot installation token
+        id: app_token
+        if: ${{ !cancelled() && steps.autofix_gate.outputs.enabled == 'true' }}
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.RUNNER_POLICY_APP_ID || vars.STRATUS_APP_ID }}
+          private-key: ${{ secrets.RUNNER_POLICY_PRIVATE_KEY || secrets.STRATUS_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Apply label swap and push to PR branch
+        if: ${{ !cancelled() && steps.autofix_gate.outputs.enabled == 'true' && steps.app_token.outputs.token != '' }}
+        env:
+          APP_TOKEN: ${{ steps.app_token.outputs.token }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          workdir=$(mktemp -d)
+          trap 'rm -rf "$workdir"' EXIT
+
+          # Fresh clone of the PR branch using the App token (the checkout at
+          # the top of this job is a detached merge-commit; not useful for
+          # push-back). --depth 1 is enough — we only modify current files.
+          git clone --quiet --branch "$HEAD_REF" --single-branch --depth 1 \
+            "https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "$workdir"
+          cd "$workdir"
+
+          git config user.name  "runner-policy-bot"
+          git config user.email "runner-policy-bot[bot]@users.noreply.github.com"
+
+          # Race guard: if the developer pushed during the check, the head
+          # SHA has moved. Bail rather than potentially overwrite their work.
+          actual_sha=$(git rev-parse HEAD)
+          if [[ "$actual_sha" != "$HEAD_SHA" ]]; then
+            echo "::warning::PR head moved ($HEAD_SHA -> $actual_sha) — skipping auto-fix to avoid racing the developer"
+            exit 0
+          fi
+
+          changed=0
+          while IFS='|' read -r ent_file ent_runner ent_suggest; do
+            [[ -z "${ent_suggest:-}" ]] && continue
+            [[ -z "${ent_file:-}" || -z "${ent_runner:-}" ]] && continue
+            # `ent_file` is the basename (e.g. `deploy-api.yml`) — the
+            # violation source writes just `$(basename "$workflow")`.
+            # Reconstruct the repo-relative path so the file-exists test,
+            # perl -pi, and `git add` all hit the actual tree location.
+            ent_file=".github/workflows/${ent_file}"
+            [[ ! -f "$ent_file" ]] && continue
+            # Scope the substitution to `runs-on:` lines only. The retired
+            # label may also appear in comments, `echo` strings, or docs
+            # elsewhere in the file — rewriting those silently would produce
+            # surprise edits in a bot-authored commit. Matching `^\s*runs-on:`
+            # on each line before applying `s///` covers the single-line
+            # forms (`runs-on: ci-standard-runc-x64`, `runs-on: [x, y]`, and
+            # expression forms that use a `needs.<job>.outputs.<name>` runner
+            # that embed the label literally). Rare multi-line list forms
+            # are intentionally not rewritten — they're surfaced to the
+            # developer via the Slice 1 Step Summary preview instead.
+            #
+            # \Q..\E quotemeta defends against any regex metachars in the
+            # label (no current label has them, but belt-and-braces).
+            if RUNNER="$ent_runner" SUGGEST="$ent_suggest" perl -pi \
+              -e 'if (/^\s*runs-on:/) { s/\b\Q$ENV{RUNNER}\E\b/$ENV{SUGGEST}/g }' \
+              "$ent_file"; then
+              # Per-file sanity ceiling. A legitimate swap edits one
+              # `runs-on:` line (sometimes two for a matrix file). `numstat`
+              # reports added+deleted; for pure label substitution each
+              # edited line produces exactly 1 added + 1 deleted. Cap at 6
+              # total = up to 3 `runs-on:` edits per file, which is already
+              # more than any workflow in the repo set has. Exceeding the
+              # cap = the regex grew teeth; refuse to push the whole run.
+              read -r added deleted _ < <(git diff --numstat -- "$ent_file" 2>/dev/null || echo "0 0 _")
+              diff_total=$(( ${added:-0} + ${deleted:-0} ))
+              if (( diff_total > 6 )); then
+                echo "::error::Auto-fix bot: ${ent_file} has ${diff_total} diff lines (>6). Refusing to push; manual review required. Retired=${ent_runner} Suggested=${ent_suggest}."
+                exit 1
+              fi
+              git add -- "$ent_file"
+              changed=1
+            fi
+          done < /tmp/retired-violations.txt
+
+          if [[ "$changed" -eq 0 ]] || git diff --cached --quiet; then
+            echo "::notice::No net changes after swap — labels may already match main"
+            exit 0
+          fi
+
+          git commit \
+            -m "Swap retired arch-pinned runner labels for unified tiers" \
+            -m "Addresses Scheduler-Systems/stratus#2380. The runner-policy check detected deprecated arch-pinned runner labels (e.g. ci-medium-runc-x64); this commit replaces them with their unified-tier equivalents (e.g. ci-medium) so Kubernetes can place the pod across amd64+arm64." \
+            -m "Review the diff before merging. If any replaced label was intentionally arch-pinned (Android NDK, amd64-only tools, etc.), revert that line and add an entry to infra/github/runner-policy-exceptions.yml."
+
+          if ! git push origin "HEAD:${HEAD_REF}"; then
+            echo "::warning::Push rejected (non-fast-forward). Developer likely pushed during check. Re-run to retry."
+            exit 0
+          fi
+
+          {
+            echo ""
+            echo "### runner-policy-bot auto-fix applied"
+            echo ""
+            echo "The runner-policy bot pushed a commit to \`${HEAD_REF}\` swapping retired arch-pinned labels to unified tiers. The check above is now stale — re-run it and it should pass."
+          } >> "$GITHUB_STEP_SUMMARY"
